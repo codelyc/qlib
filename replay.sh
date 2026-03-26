@@ -42,7 +42,12 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QLIB_SRC="$SCRIPT_DIR"   # replay.sh 在 qlib/ 里，qlib 源码就是同级目录
-
+# 加载 .env（QLIB_DATA_DIR / DOCKER_IMAGE 等可在此覆盖）
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    set -a; source "$PROJECT_ROOT/.env"; set +a
+fi
+# Qlib 数据目录（宿主机，含 features/ calendars/ instruments/）
+QLIB_DATA_DIR="${QLIB_DATA_DIR:-$PROJECT_ROOT/qlib/data}"
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════╗${RESET}"
 echo -e "${BOLD}║   🔁  因子工作区本地复刻脚本  replay.sh      ║${RESET}"
@@ -127,15 +132,15 @@ PIP_HOST="mirrors.aliyun.com"
 # ══════════════════════════════════════════════════════════════
 # Step 3：创建/复用 conda 环境 + 安装依赖
 # ══════════════════════════════════════════════════════════════
-step "Step 3/5  准备 conda 环境 qlib_env (Python 3.8)"
+step "Step 3/5  准备 conda 环境 qlib_env (Python 3.10)"
 
 ENV_NAME="qlib_env"
 
 if conda env list 2>/dev/null | grep -q "^${ENV_NAME}[[:space:]]"; then
     info "环境 $ENV_NAME 已存在，跳过创建"
 else
-    echo -e "  🔧 创建环境 $ENV_NAME (Python 3.8)..."
-    conda create -n "$ENV_NAME" python=3.8 -y
+    echo -e "  🔧 创建环境 $ENV_NAME (Python 3.10)..."
+    conda create -n "$ENV_NAME" python=3.10 -y
     info "环境创建完成"
 fi
 
@@ -173,7 +178,9 @@ info "环境就绪  qlib=${QLIB_VER}  pandas=${PANDAS_VER}"
 # ══════════════════════════════════════════════════════════════
 step "Step 4/6  检查并修复 Qlib 数据目录结构"
 
-CN_DATA="$HOME/.qlib/qlib_data/cn_data"
+# 数据目录：优先用 .env 中的 QLIB_DATA_DIR，fallback 到 $PROJECT_ROOT/qlib/data
+CN_DATA="$QLIB_DATA_DIR"
+echo -e "  数据目录: ${CYAN}$CN_DATA${RESET}"
 if [ ! -d "$CN_DATA" ]; then
     warn "数据目录 $CN_DATA 不存在，回测可能会失败！"
 else
@@ -210,43 +217,21 @@ fi
 # ══════════════════════════════════════════════════════════════
 # Step 5：自动发现 factor_workspace/
 # ══════════════════════════════════════════════════════════════
-step "Step 5/6  发现因子工作区"
+step "Step 5/6  加载因子工作区"
 
-FW_BASE="$PROJECT_ROOT/factor_workspace"
-
-if [ ! -d "$FW_BASE" ]; then
-    error "找不到 $FW_BASE，请确认项目结构正确"
+# EXP_ROOT 从 .env 读取（已在上方 source .env 时加载）
+if [ -z "${EXP_ROOT:-}" ]; then
+    error "EXP_ROOT 未配置，请在 .env 中设置 EXP_ROOT 指向你的因子工作区"
+    error "例如: EXP_ROOT=\$FACTOR_WORKSPACE_DIR/market_trend_factor"
     exit 1
 fi
 
-# 如果外部未指定 EXP_ROOT，自动发现
-if [ -z "${EXP_ROOT:-}" ]; then
-    subdirs=()
-    while IFS= read -r d; do
-        subdirs+=("$d")
-    done < <(find "$FW_BASE" -mindepth 1 -maxdepth 1 -type d | sort)
-
-    count=${#subdirs[@]}
-
-    if [ "$count" -eq 0 ]; then
-        error "$FW_BASE 下没有工作区子目录"
-        exit 1
-    elif [ "$count" -eq 1 ]; then
-        EXP_ROOT="${subdirs[0]}"
-        info "自动使用工作区: $EXP_ROOT"
-    else
-        warn "发现多个工作区，请通过 EXP_ROOT 指定后重新运行："
-        echo ""
-        for d in "${subdirs[@]}"; do
-            echo -e "      ${CYAN}EXP_ROOT=$d bash $0${RESET}"
-        done
-        echo ""
-        exit 1
-    fi
-else
-    EXP_ROOT="$(cd "$EXP_ROOT" && pwd)"
-    info "使用指定工作区: $EXP_ROOT"
+if [ ! -d "$EXP_ROOT" ]; then
+    error "EXP_ROOT 目录不存在: $EXP_ROOT"
+    error "请先运行 init_workspace.sh 创建工作区，或修改 .env 中的 EXP_ROOT"
+    exit 1
 fi
+info "工作区: $EXP_ROOT"
 
 # 检查 daily_pv.h5
 if [ ! -f "$EXP_ROOT/daily_pv.h5" ]; then
@@ -395,15 +380,11 @@ runpy.run_path('factor.py', run_name='__main__')
     fi
     info "combined_factors_df.parquet 已生成 ($ROUND_NAME)"
 
-    # ── 5c. 复制并修正回测所需配置文件 ──────────────────
+    # ── 5c. 复制回测所需配置文件 ─────────────────────
     cp "$EXP_ROOT/conf_combined_factors.yaml" "$ROUND_DIR/"
     cp "$EXP_ROOT/read_exp_res.py" "$ROUND_DIR/"
-    
-    # 修正回测时间（避免 Empty data from dataset 错误）
-    # 将 start_time / train 统一改成 2009-01-01（因为我们的新因子最早的数据从 2009-01 开始）
-    sed -i 's/"2008-01-01"/"2009-01-01"/g' "$ROUND_DIR/conf_combined_factors.yaml"
-    
-    info "conf_combined_factors.yaml + read_exp_res.py 已复制并修正时间 ($ROUND_NAME/)"
+    # qrun 从环境变量读取回测参数（source .env 后自动可用），无需额外配置文件
+    info "conf_combined_factors.yaml + read_exp_res.py 已复制 ($ROUND_NAME/)"
 
     SUCCESS_ROUNDS+=("$ROUND_DIR")
 done
@@ -442,12 +423,12 @@ for ROUND_DIR in "${SUCCESS_ROUNDS[@]}"; do
     echo -e "  ${BOLD}── $ROUND_NAME ──────────────────────────────────────────────${RESET}"
     echo ""
     echo -e "  ${YELLOW}# 1. 运行回测${RESET}"
-    echo -e "  ${YELLOW}#    （模型/数据/参数已在 yaml 里写好，qrun 一条命令完成训练+回测）${RESET}"
+    echo -e "  ${YELLOW}#    （参数由 .env 环境变量提供，source .env 后 qrun 自动读取）${RESET}"
     echo -e "  ${CYAN}cd $ROUND_DIR${RESET}"
-    echo -e "  ${CYAN}sed -i 's/2008-01-01/2010-01-01/g' conf_combined_factors.yaml${RESET}"
-    echo -e "  ${CYAN}export MLFLOW_TRACKING_URI=\"file://\$(pwd)/mlruns_local\"${RESET}"
     echo -e "  ${CYAN}qrun conf_combined_factors.yaml${RESET}"
     echo -e "  ${CYAN}python read_exp_res.py${RESET}"
+    echo ""
+    echo -e "  ${YELLOW}#    如需调整参数（日期/模型/策略），编辑项目根目录的 .env${RESET}"
     echo ""
     echo -e "  ${YELLOW}# 2. 分析结果（对比历史 SOTA）${RESET}"
     echo -e "  ${CYAN}python $EXP_ROOT/analyze_results.py \\"

@@ -4,14 +4,18 @@
 借鉴: rdagent/scenarios/qlib/developer/factor_runner.py (deduplicate + merge + MultiIndex columns)
 
 用法:
+  # 合并所有因子（默认模式，与原有行为一致）
   python merge_factors.py <round_dir> [--sota-file <path>]
 
+  # 单因子模式：只取指定因子，输出到因子子目录
+  python merge_factors.py <round_dir> --single <factor_name> [--sota-file <path>]
+
 功能:
-  1. 扫描 round_dir 下所有子目录的 result.h5
+  1. 扫描 round_dir 下所有子目录的 result.h5（或 --single 指定的单个因子）
   2. 验证每个因子的输出格式 (MultiIndex, 日级数据)
   3. 与 SOTA 因子去重 (IC 相关性 > 0.99 则剔除)
   4. 合并后添加 MultiIndex columns: ("feature", factor_name) — Qlib StaticDataLoader 格式
-  5. 保存为 combined_factors_df.parquet
+  5. 保存为 combined_factors_df.parquet 或 single_factor_df.parquet
 """
 import argparse
 import sys
@@ -22,10 +26,30 @@ import numpy as np
 import pandas as pd
 
 
+def _read_hdf_compat(path: Path, key: str = "data") -> pd.DataFrame:
+    """读取 HDF5 文件，兼容 pandas 版本差异（datetime64[ns] 索引类型问题）"""
+    try:
+        return pd.read_hdf(path, key=key)
+    except Exception:
+        # pandas 2.x 与 Docker 内 pandas 版本不一致时，
+        # datetime64[ns] 索引类型可能无法识别。使用 monkey-patch 修复。
+        import pandas.io.pytables as pytables
+        orig_fn = pytables._unconvert_index
+        def _patched(data, kind, encoding=None, errors="strict"):
+            if kind == "datetime64" or (isinstance(kind, str) and kind.startswith("datetime64")):
+                return pd.DatetimeIndex(data)
+            return orig_fn(data, kind, encoding, errors)
+        pytables._unconvert_index = _patched
+        try:
+            return pd.read_hdf(path, key=key)
+        finally:
+            pytables._unconvert_index = orig_fn
+
+
 def load_and_validate_factor(result_h5: Path) -> Optional[pd.DataFrame]:
     """加载单个因子并验证格式"""
     try:
-        df = pd.read_hdf(result_h5, key="data")
+        df = _read_hdf_compat(result_h5)
     except Exception as e:
         print(f"  ❌ 读取失败 {result_h5}: {e}")
         return None
@@ -88,36 +112,71 @@ def deduplicate_factors(
             keep_cols.append(new_col)
 
     if not keep_cols:
-        print("  ⚠️ 所有新因子都与 SOTA 重复！")
-        return pd.DataFrame()
+        removed = [c for c in new_df.columns if c not in keep_cols]
+        print(f"  ❌ 所有新因子都与 SOTA 高度相关，已全部去重！")
+        print(f"     被去重的因子: {removed}")
+        print(f"     建议: 尝试不同思路的因子（换公式/换特征/换时间窗口）")
+        # 返回空 DataFrame 并标记 dedup_all=True，让调用方能感知
+        result = pd.DataFrame()
+        result.attrs["dedup_all"] = True
+        return result
 
+    removed = [c for c in new_df.columns if c not in keep_cols]
+    if removed:
+        print(f"  📋 去重日志: 保留 {keep_cols}，去除 {removed}")
     return new_df[keep_cols]
 
 
-def merge_factors(round_dir: str, sota_file: Optional[str] = None) -> Optional[pd.DataFrame]:
-    """合并本轮所有因子 + SOTA 因子"""
+def merge_factors(
+    round_dir: str,
+    sota_file: Optional[str] = None,
+    single_factor: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """合并本轮所有因子 + SOTA 因子。
+
+    Args:
+        round_dir: 本轮工作目录
+        sota_file: SOTA 因子 parquet 文件路径
+        single_factor: 若指定，只取该因子（用于单因子独立回测）
+    """
     round_path = Path(round_dir).resolve()
     new_factors = []
     factor_names = []
 
-    print(f"📁 扫描目录: {round_path}")
-
-    # 遍历子目录找 result.h5
-    for sub_dir in sorted(round_path.iterdir()):
-        if not sub_dir.is_dir():
-            continue
-        result_file = sub_dir / "result.h5"
-        if not result_file.exists():
-            continue
-
-        print(f"\n  加载因子: {sub_dir.name}")
+    if single_factor:
+        # ── 单因子模式 ─────────────────────────────────────────
+        factor_dir = round_path / single_factor
+        result_file = factor_dir / "result.h5"
+        print(f"📁 单因子模式: {single_factor}")
+        if not factor_dir.is_dir() or not result_file.exists():
+            print(f"  ❌ 找不到 {result_file}")
+            return None
         df = load_and_validate_factor(result_file)
         if df is not None:
             print(f"  ✅ shape={df.shape}, cols={list(df.columns)}")
             new_factors.append(df)
-            factor_names.append(sub_dir.name)
+            factor_names.append(single_factor)
         else:
-            print(f"  ⏭️  跳过 {sub_dir.name}")
+            print(f"  ❌ 验证失败: {single_factor}")
+            return None
+    else:
+        # ── 全量模式（原有逻辑）──────────────────────────────
+        print(f"📁 扫描目录: {round_path}")
+        for sub_dir in sorted(round_path.iterdir()):
+            if not sub_dir.is_dir():
+                continue
+            result_file = sub_dir / "result.h5"
+            if not result_file.exists():
+                continue
+
+            print(f"\n  加载因子: {sub_dir.name}")
+            df = load_and_validate_factor(result_file)
+            if df is not None:
+                print(f"  ✅ shape={df.shape}, cols={list(df.columns)}")
+                new_factors.append(df)
+                factor_names.append(sub_dir.name)
+            else:
+                print(f"  ⏭️  跳过 {sub_dir.name}")
 
     if not new_factors:
         print("\n❌ 没有找到有效的因子文件")
@@ -129,7 +188,7 @@ def merge_factors(round_dir: str, sota_file: Optional[str] = None) -> Optional[p
     new_combined = new_combined.loc[:, ~new_combined.columns.duplicated(keep="last")]
     print(f"\n新因子合并: {new_combined.shape} ({list(new_combined.columns)})")
 
-    # 加载 SOTA 因子并去重
+    # 加载 SOTA 因子并去重（单因子模式跳过去重，直接输出单因子即可）
     sota_df = pd.DataFrame()
     if sota_file and Path(sota_file).exists():
         try:
@@ -142,13 +201,23 @@ def merge_factors(round_dir: str, sota_file: Optional[str] = None) -> Optional[p
             print(f"⚠️ 加载 SOTA 失败: {e}")
             sota_df = pd.DataFrame()
 
-    if not sota_df.empty:
+    if single_factor:
+        # 单因子模式：不去重，直接使用该因子（目的是观察单因子的独立增量贡献）
+        combined = new_combined
+        print(f"  ℹ️ 单因子模式: 跳过 IC 去重")
+    elif not sota_df.empty:
         new_combined = deduplicate_factors(sota_df, new_combined)
         if new_combined.empty:
-            print("❌ 去重后无新因子，仅使用 SOTA 因子")
+            if new_combined.attrs.get("dedup_all"):
+                # 所有新因子都被去重 → 需要换思路，退出码 2 供 Agent 判断
+                err_msg = "所有新因子与 SOTA 高度相关（IC>0.99），全部被去重，需要更换因子思路"
+                print(f"\n❌ {err_msg}")
+                _auto_record_merge_error(str(round_path), err_msg, "dedup_all")
+                sys.exit(2)
+            print("⚠️ 去重后无新因子，仅使用 SOTA 因子")
             combined = sota_df
         else:
-            combined = pd.concat([sota_df, new_combined], axis=1).dropna()
+            combined = pd.concat([sota_df, new_combined], axis=1)
     else:
         combined = new_combined
 
@@ -159,8 +228,11 @@ def merge_factors(round_dir: str, sota_file: Optional[str] = None) -> Optional[p
     new_columns = pd.MultiIndex.from_product([["feature"], combined.columns])
     combined.columns = new_columns
 
-    # 保存
-    output_path = round_path / "combined_factors_df.parquet"
+    # 保存 — 单因子模式输出到因子子目录，全量模式输出到 round_dir
+    if single_factor:
+        output_path = round_path / single_factor / "single_factor_df.parquet"
+    else:
+        output_path = round_path / "combined_factors_df.parquet"
     combined.to_parquet(output_path, engine="pyarrow")
 
     print(f"\n💾 已保存: {output_path}")
@@ -170,11 +242,49 @@ def merge_factors(round_dir: str, sota_file: Optional[str] = None) -> Optional[p
     return combined
 
 
+def _auto_record_merge_error(round_dir: str, error_msg: str, error_type: str = "merge"):
+    """合并失败时自动记录到错误知识库"""
+    round_path = Path(round_dir).resolve()
+    exp_root = round_path.parent  # round_dir -> exp_root
+    collect_py = exp_root / "collect_error.py"
+    if not collect_py.exists():
+        return
+    import re as _re
+    round_num = 0
+    m = _re.search(r"round[_\-]?(\d+)", round_path.name, _re.IGNORECASE)
+    if m:
+        round_num = int(m.group(1))
+    try:
+        import subprocess
+        subprocess.run(
+            [
+                sys.executable, str(collect_py), "record",
+                "--exp-root", str(exp_root),
+                "--round", str(round_num),
+                "--stage", "merge",
+                "--error", error_msg[:200],
+                "--error-type", error_type,
+            ],
+            check=False, capture_output=True,
+        )
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="合并量化因子")
     parser.add_argument("round_dir", help="本轮工作目录")
     parser.add_argument("--sota-file", help="SOTA 因子 parquet 文件路径", default=None)
+    parser.add_argument(
+        "--single",
+        metavar="FACTOR_NAME",
+        help="单因子模式：只取指定因子，输出到因子子目录的 single_factor_df.parquet",
+        default=None,
+    )
     args = parser.parse_args()
 
-    result = merge_factors(args.round_dir, args.sota_file)
-    sys.exit(0 if result is not None else 1)
+    result = merge_factors(args.round_dir, args.sota_file, single_factor=args.single)
+    if result is None:
+        _auto_record_merge_error(args.round_dir, "没有找到有效的因子文件 (result.h5)", "data_missing")
+        sys.exit(1)
+    sys.exit(0)

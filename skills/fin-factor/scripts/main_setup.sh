@@ -1,6 +1,6 @@
 #!/bin/bash
 # 因子研发环境 一键初始化 / 检查 / 修复
-# 用法: bash setup_env.sh
+# 用法: bash main_setup.sh
 #
 # 交互式流程：
 #   1. 询问是否重置环境（默认 N，回车跳过）
@@ -22,14 +22,8 @@ if [ "$(id -u)" -eq 0 ]; then
     exit 1
 fi
 
-# 定位项目根目录和 skill 目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROJECT_ROOT="$(cd "$SKILL_DIR/../../.." && pwd)"
-if [ ! -d "$PROJECT_ROOT/.github/skills/fin-factor" ]; then
-    PROJECT_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")"
-    SKILL_DIR="$PROJECT_ROOT/.github/skills/fin-factor"
-fi
+# 加载公共配置（自动定位 .env 并 source）
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 PASS=0
 FAIL=0
@@ -64,8 +58,8 @@ if [[ "$RESET_ANSWER" =~ ^[Yy]$ ]]; then
     fi
 
     # 删除 Qlib 数据
-    QLIB_DATA_RESET="$PROJECT_ROOT/data/qlib/cn_data"
-    if [ -d "$QLIB_DATA_RESET" ] && [ "$(ls -A "$QLIB_DATA_RESET" 2>/dev/null | head -1)" ]; then
+    QLIB_DATA_RESET="$QLIB_DATA_DIR"
+    if [ -d "$QLIB_DATA_RESET" ] && [ -d "$QLIB_DATA_RESET/features" ]; then
         echo "  🗑️  删除 Qlib 数据: $QLIB_DATA_RESET ..."
         rm -rf "$QLIB_DATA_RESET"
         echo "  ✅ Qlib 数据已删除"
@@ -133,64 +127,82 @@ fi
 # ── 3. Qlib 数据 ────────────────────────────────────────────
 echo ""
 echo "3️⃣  Qlib 数据"
-QLIB_DATA="$PROJECT_ROOT/data/qlib/cn_data"
-if [ -d "$QLIB_DATA" ] && [ "$(ls -A "$QLIB_DATA" 2>/dev/null | head -1)" ]; then
-    file_count=$(find "$QLIB_DATA" -type f 2>/dev/null | head -100 | wc -l)
-    check_pass "Qlib 数据: $QLIB_DATA (${file_count}+ 文件)"
+QLIB_DATA="$QLIB_DATA_DIR"  # 使用已从 .env 加载的变量
+if [ -d "$QLIB_DATA" ] && [ -d "$QLIB_DATA/features" ]; then
+    file_count=$(find "$QLIB_DATA/features" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+    check_pass "Qlib 数据: $QLIB_DATA (${file_count} 支股票)"
 else
-    check_fail "Qlib 数据不存在: $QLIB_DATA"
+    check_fail "Qlib 数据不存在或不完整: $QLIB_DATA"
     echo "     🔧 从社区源下载 Qlib CN 数据 ..."
     if true; then
         echo "     来源: github.com/chenditc/investment_data"
-        mkdir -p "$PROJECT_ROOT/data/qlib/cn_data"
+        mkdir -p "$QLIB_DATA"
         DOWNLOADED=false
         URL="https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
-        TARBALL="/tmp/qlib_bin.tar.gz"
+        # 下载目录：优先用 .env 中的 QLIB_DOWNLOAD_DIR，否则用项目内的 qlib/downloads/
+        DOWNLOAD_DIR="${QLIB_DOWNLOAD_DIR:-$PROJECT_ROOT/qlib/downloads}"
+        mkdir -p "$DOWNLOAD_DIR"
+        TARBALL="$DOWNLOAD_DIR/qlib_bin.tar.gz"
 
-        # 下载（带进度条）
-        if command -v wget &>/dev/null; then
-            echo "     正在下载 (wget) ..."
-            wget --progress=bar:force -O "$TARBALL" "$URL" 2>&1
-        elif command -v curl &>/dev/null; then
-            echo "     正在下载 (curl) ..."
-            curl -L --progress-bar -o "$TARBALL" "$URL" 2>&1
-        else
-            echo "     ❌ 未找到 wget 或 curl，无法下载"
+        # 下载（带进度条；若缓存已存在则跳过）
+        if [ -f "$TARBALL" ]; then
+            CACHED_SIZE=$(stat -c%s "$TARBALL" 2>/dev/null || stat -f%z "$TARBALL" 2>/dev/null || echo "0")
+            if [ "$CACHED_SIZE" -gt 1000000 ]; then
+                echo "     ♻️  发现缓存: $TARBALL ($(du -h "$TARBALL" | cut -f1))，跳过下载"
+            else
+                echo "     ⚠️  缓存文件过小，重新下载..."
+                rm -f "$TARBALL"
+            fi
         fi
 
-        # 解压（tarball 内部是 qlib_bin/{calendars,features,instruments}，需要展平）
+        if [ ! -f "$TARBALL" ]; then
+            if command -v wget &>/dev/null; then
+                echo "     正在下载 (wget) ..."
+                echo "     下载到: $TARBALL"
+                wget --progress=bar:force -O "$TARBALL" "$URL" 2>&1
+            elif command -v curl &>/dev/null; then
+                echo "     正在下载 (curl) ..."
+                echo "     下载到: $TARBALL"
+                curl -L --progress-bar -o "$TARBALL" "$URL" 2>&1
+            else
+                echo "     ❌ 未找到 wget 或 curl，无法下载"
+            fi
+        fi
+
+        # 解压（tarball 内部是 qlib_bin/{calendars,features,instruments}）
         if [ -f "$TARBALL" ]; then
             FSIZE=$(stat -c%s "$TARBALL" 2>/dev/null || stat -f%z "$TARBALL" 2>/dev/null || echo "0")
             if [ "$FSIZE" -gt 1000000 ]; then
                 echo "     正在解压 ..."
-                TMP_EXTRACT="/tmp/qlib_extract_$$"
+                TMP_EXTRACT="$DOWNLOAD_DIR/qlib_extract_$$"
                 mkdir -p "$TMP_EXTRACT"
                 tar -zxf "$TARBALL" -C "$TMP_EXTRACT"
-                # 展平: features/ 下的股票目录 + calendars/ + instruments/ 全部平铺到 cn_data/
+                # 解压后整目录移动，保留 features/ calendars/ instruments/ 子目录结构
                 QLIB_BIN="$TMP_EXTRACT/qlib_bin"
                 if [ -d "$QLIB_BIN/features" ]; then
                     echo "     正在整理目录结构 ..."
-                    mv "$QLIB_BIN/features"/* "$PROJECT_ROOT/data/qlib/cn_data/" 2>/dev/null
-                    mv "$QLIB_BIN/calendars"/* "$PROJECT_ROOT/data/qlib/cn_data/" 2>/dev/null
-                    mv "$QLIB_BIN/instruments"/* "$PROJECT_ROOT/data/qlib/cn_data/" 2>/dev/null
+                    mv "$QLIB_BIN/features"    "$QLIB_DATA/features"
+                    mv "$QLIB_BIN/calendars"   "$QLIB_DATA/calendars"
+                    mv "$QLIB_BIN/instruments" "$QLIB_DATA/instruments"
                     DOWNLOADED=true
                 else
-                    # fallback: 如果没有 features 子目录，用 strip-components=1
-                    mv "$QLIB_BIN"/* "$PROJECT_ROOT/data/qlib/cn_data/" 2>/dev/null && DOWNLOADED=true
+                    # fallback: 直接移动整个 qlib_bin 目录内容
+                    mv "$QLIB_BIN"/* "$QLIB_DATA/" 2>/dev/null && DOWNLOADED=true
                 fi
                 rm -rf "$TMP_EXTRACT"
+                echo "     💾 tar 包已保留在: $TARBALL (下次重置可直接复用)"
             else
                 echo "     ❌ 下载文件过小 (${FSIZE} bytes)，可能下载失败"
+                rm -f "$TARBALL"
             fi
-            rm -f "$TARBALL"
         fi
 
         if $DOWNLOADED && [ -d "$QLIB_DATA" ] && [ "$(ls -A "$QLIB_DATA" 2>/dev/null | head -1)" ]; then
             check_fixed "Qlib 数据下载完成"
         else
             echo "     ❌ 自动下载失败，请手动:"
-            echo "        wget https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
-            echo "        tar -zxf qlib_bin.tar.gz -C $PROJECT_ROOT/data/qlib/cn_data --strip-components=2"
+            echo "        wget -O $TARBALL https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
+            echo "        mkdir -p $QLIB_DATA && tar -zxf $TARBALL -C $QLIB_DATA --strip-components=1"
         fi
     fi
 fi

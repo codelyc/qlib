@@ -1,37 +1,50 @@
+# ═══════════════════════════════════════════════════════════════
+# Alpha158 基线回测配置（Jinja2 模板）
+# ═══════════════════════════════════════════════════════════════
+# 参数由 .env 环境变量提供，qrun 自动渲染。
+# 也可通过 export 临时覆盖，如: export train_start=2010-01-01
+# ═══════════════════════════════════════════════════════════════
+
 qlib_init:
-    provider_uri: "~/.qlib/qlib_data/cn_data"
+    provider_uri: {{ QLIB_PROVIDER_URI | default("/qlib_data", true) }}
     region: cn
 
-market: &market csi300
-benchmark: &benchmark SH000300
+market: &market {{ market | default("csi300", true) }}
+benchmark: &benchmark {{ benchmark | default("SH000300", true) }}
 
 data_handler_config: &data_handler_config
-    start_time: "2008-01-01"
-    end_time: "__DATA_END_DATE__"
-    fit_start_time: "2008-01-01"
-    fit_end_time: "2014-12-31"
+    start_time: {{ train_start | default("2020-01-01", true) }}
+    end_time: {{ test_end | default("null", true) }}
     instruments: *market
+    data_loader:
+        class: NestedDataLoader
+        kwargs:
+            dataloader_l:
+                - class: qlib.contrib.data.loader.Alpha158DL
+                  kwargs:
+                    config:
+                        label: 
+                            - ["Ref($close, -2)/Ref($close, -1) - 1"]
+                            - ["LABEL0"]
+                        feature:
+                            - {{ feature_expressions }}
+                            - {{ feature_names }}
+    
     infer_processors:
-        - class: FilterCol
-          kwargs:
-              fields_group: feature
-              col_list: ["RESI5", "WVMA5", "RSQR5", "KLEN", "RSQR10", "CORR5", "CORD5", "CORR10", 
-                            "ROC60", "RESI10", "VSTD5", "RSQR60", "CORR60", "WVMA60", "STD5", 
-                            "RSQR20", "CORD60", "CORD10", "CORR20", "KLOW"
-                        ]
         - class: RobustZScoreNorm
           kwargs:
               fields_group: feature
               clip_outlier: true
+              fit_start_time: {{ fit_start_time | default("2020-01-01", true) }}
+              fit_end_time: {{ fit_end_time | default("2022-12-31", true) }}
         - class: Fillna
           kwargs:
               fields_group: feature
     learn_processors:
         - class: DropnaLabel
-        - class: CSRankNorm
+        - class: CSZScoreNorm
           kwargs:
               fields_group: label
-    label: ["Ref($close, -2) / Ref($close, -1) - 1"] 
 
 port_analysis_config: &port_analysis_config
     strategy:
@@ -39,57 +52,58 @@ port_analysis_config: &port_analysis_config
         module_path: qlib.contrib.strategy
         kwargs:
             signal: <PRED>
-            topk: 50
-            n_drop: 5
+            topk: {{ topk | default(50, true) }}
+            n_drop: {{ n_drop | default(5, true) }}
     backtest:
-        start_time: "2017-01-01"
-        end_time: "__DATA_END_DATE__"
-        account: 100000000
+        start_time: {{ test_start | default("2017-01-01", true) }}
+        end_time: {{ test_end | default("null", true) }}
+        account: {{ account | default(100000000, true) }}
         benchmark: *benchmark
         exchange_kwargs:
             limit_threshold: 0.095
             deal_price: close
-            open_cost: 0.0005
-            close_cost: 0.0015
+            open_cost: {{ open_cost | default(0.0005, true) }}
+            close_cost: {{ close_cost | default(0.0015, true) }}
             min_cost: 5
+
 task:
     model:
         class: LGBModel
         module_path: qlib.contrib.model.gbdt
         kwargs:
             loss: mse
-            colsample_bytree: 0.8879
-            learning_rate: 0.2
-            subsample: 0.8789
-            lambda_l1: 205.6999
-            lambda_l2: 580.9768
-            max_depth: 8
-            num_leaves: 210
-            num_threads: 20
+            colsample_bytree: {{ colsample_bytree | default(0.8879, true) }}
+            learning_rate: {{ learning_rate | default(0.2, true) }}
+            subsample: {{ subsample | default(0.8789, true) }}
+            lambda_l1: {{ lambda_l1 | default(205.6999, true) }}
+            lambda_l2: {{ lambda_l2 | default(580.9768, true) }}
+            max_depth: {{ max_depth | default(8, true) }}
+            num_leaves: {{ num_leaves | default(210, true) }}
+            num_threads: {{ num_threads | default(20, true) }}
     dataset:
         class: DatasetH
         module_path: qlib.data.dataset
         kwargs:
             handler:
-                class: Alpha158
+                class: DataHandlerLP
                 module_path: qlib.contrib.data.handler
                 kwargs: *data_handler_config
             segments:
-                train: ["2008-01-01", "2014-12-31"]
-                valid: ["2015-01-01", "2016-12-31"]
-                test: ["2017-01-01", "__DATA_END_DATE__"]
-    record: 
+                train: [{{ train_start | default("2020-01-01", true) }}, {{ train_end | default("2022-12-31", true) }}]
+                valid: [{{ valid_start | default("2023-01-01", true) }}, {{ valid_end | default("2024-12-31", true) }}]
+                test: [{{ test_start | default("2025-01-01", true) }}, {{ test_end | default("null", true) }}]
+    record:
         - class: SignalRecord
           module_path: qlib.workflow.record_temp
-          kwargs: 
+          kwargs:
             model: <MODEL>
             dataset: <DATASET>
         - class: SigAnaRecord
           module_path: qlib.workflow.record_temp
-          kwargs: 
+          kwargs:
             ana_long_short: False
             ann_scaler: 252
         - class: PortAnaRecord
           module_path: qlib.workflow.record_temp
-          kwargs: 
+          kwargs:
             config: *port_analysis_config

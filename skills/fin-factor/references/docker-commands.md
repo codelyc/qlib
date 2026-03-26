@@ -3,7 +3,7 @@
 ## 前提
 
 - Docker 镜像 `local_qlib:latest` 已构建
-- Qlib 数据已下载到 `$PROJECT_ROOT/data/qlib/cn_data/`（通过 `setup_env.sh` 自动下载）
+- Qlib 数据已下载到 `$PROJECT_ROOT/data/qlib/cn_data/`（通过 `main_setup.sh` 自动下载）
 
 ## 构建 Docker 镜像
 
@@ -54,6 +54,20 @@ docker run --rm \
   local_qlib:latest \
   bash -c "cd /workspace/qlib_workspace && python read_exp_res.py"
 ```
+
+## 生成静态基线
+
+初始化工作空间时自动调用 `run_baseline.sh`，也可手动执行：
+
+```bash
+# 自动执行（init_workspace.sh 末尾自动调用）
+bash .github/skills/fin-factor/scripts/run_baseline.sh $EXP_ROOT
+
+# 强制重跑（覆盖已有基线）
+bash .github/skills/fin-factor/scripts/run_baseline.sh $EXP_ROOT --force
+```
+
+产出：`$EXP_ROOT/baseline_record.json`（当前 `ACTIVE_FEATURE_SET` 基线指标，后续轮次不变）
 
 ## 查看回测结果
 

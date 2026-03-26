@@ -1,0 +1,106 @@
+# ═══════════════════════════════════════════════════════════════
+# 单因子回测配置（Jinja2 模板）
+# ═══════════════════════════════════════════════════════════════
+# 与 conf_combined_factors.yaml 相同，唯一区别：
+#   StaticDataLoader 加载 single_factor_df.parquet（单因子）
+#   而非 combined_factors_df.parquet（所有因子合并）
+#
+# 用途：对每个因子做独立回测（Alpha158 + 单因子），
+#       观察单个因子的增量贡献，再与合并回测结果对比。
+# ═══════════════════════════════════════════════════════════════
+
+qlib_init:
+    provider_uri: {{ QLIB_PROVIDER_URI | default("/qlib_data", true) }}
+    region: cn
+
+market: &market {{ market | default("csi300", true) }}
+benchmark: &benchmark {{ benchmark | default("SH000300", true) }}
+
+data_handler_config: &data_handler_config
+    start_time: {{ train_start | default("2020-01-01", true) }}
+    end_time: {{ test_end | default("null", true) }}
+    instruments: *market
+    data_loader:
+        class: NestedDataLoader
+        kwargs:
+            dataloader_l:
+                - class: qlib.contrib.data.loader.Alpha158DL
+                  kwargs:
+                    config:
+                        label:
+                            - ["Ref($close, -2)/Ref($close, -1) - 1"]
+                            - ["LABEL0"]
+                        feature:
+                            - {{ feature_expressions }}
+                            - {{ feature_names }}
+                - class: qlib.data.dataset.loader.StaticDataLoader
+                  kwargs:
+                    config: "single_factor_df.parquet"
+
+    learn_processors:
+        - class: DropnaLabel
+        - class: CSZScoreNorm
+          kwargs:
+              fields_group: label
+
+port_analysis_config: &port_analysis_config
+    strategy:
+        class: TopkDropoutStrategy
+        module_path: qlib.contrib.strategy
+        kwargs:
+            signal: <PRED>
+            topk: {{ topk | default(50, true) }}
+            n_drop: {{ n_drop | default(5, true) }}
+    backtest:
+        start_time: {{ test_start | default("2017-01-01", true) }}
+        end_time: {{ test_end | default("null", true) }}
+        account: {{ account | default(100000000, true) }}
+        benchmark: *benchmark
+        exchange_kwargs:
+            limit_threshold: 0.095
+            deal_price: close
+            open_cost: {{ open_cost | default(0.0005, true) }}
+            close_cost: {{ close_cost | default(0.0015, true) }}
+            min_cost: 5
+
+task:
+    model:
+        class: LGBModel
+        module_path: qlib.contrib.model.gbdt
+        kwargs:
+            loss: mse
+            colsample_bytree: {{ colsample_bytree | default(0.8879, true) }}
+            learning_rate: {{ learning_rate | default(0.2, true) }}
+            subsample: {{ subsample | default(0.8789, true) }}
+            lambda_l1: {{ lambda_l1 | default(205.6999, true) }}
+            lambda_l2: {{ lambda_l2 | default(580.9768, true) }}
+            max_depth: {{ max_depth | default(8, true) }}
+            num_leaves: {{ num_leaves | default(210, true) }}
+            num_threads: {{ num_threads | default(20, true) }}
+    dataset:
+        class: DatasetH
+        module_path: qlib.data.dataset
+        kwargs:
+            handler:
+                class: DataHandlerLP
+                module_path: qlib.contrib.data.handler
+                kwargs: *data_handler_config
+            segments:
+                train: [{{ train_start | default("2020-01-01", true) }}, {{ train_end | default("2022-12-31", true) }}]
+                valid: [{{ valid_start | default("2023-01-01", true) }}, {{ valid_end | default("2024-12-31", true) }}]
+                test: [{{ test_start | default("2025-01-01", true) }}, {{ test_end | default("null", true) }}]
+    record:
+        - class: SignalRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            model: <MODEL>
+            dataset: <DATASET>
+        - class: SigAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            ana_long_short: False
+            ann_scaler: 252
+        - class: PortAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            config: *port_analysis_config
