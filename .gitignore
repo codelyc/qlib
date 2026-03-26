@@ -14,7 +14,6 @@ dist/
 *.hd5
 *.csv
 
-.env
 .vim
 .nvimrc
 .vscode
